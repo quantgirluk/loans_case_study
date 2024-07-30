@@ -72,193 +72,130 @@ class Loans_Portfolio(ABC):
         logger.info('Finished Consolidating Static and Historic Data')
 
     @staticmethod
-    def _extend_data_single_loan(df):
+    def _extend_data(dta):
 
+        df = dta.copy()
         df['Payment_Made'] = df['Payment_Made'].fillna(0)
-        df['payment_made_cumsum'] = df['Payment_Made'].cumsum()
-        df['current_balance'] = df['original_balance'] - df['payment_made_cumsum']
+        df['Payment_Due'] = df['Payment_Due'].fillna(0)
+        df['current_balance'] = df['Balance'] - \
+                                df['Payment_Due'] + df['Payment_Made']
         df['seasoning'] = df['level_1'].dt.to_period('M').astype(int) - df['origination_date'].dt.to_period('M').astype(
             int)
         df['missed_payment'] = df['Payment_Due'] > df['Payment_Made']
         df['not_missed'] = ~df['missed_payment']
-        df['n_missed_payments'] = df['missed_payment'].groupby((~df['missed_payment']).cumsum()).cumsum()
-        df['prepaid_in_month'] = (df['Payment_Due'] < df['Payment_Made']) & (df['Balance'] == 0)
+        df['n_missed_payments'] = df.groupby(['loan_id', 'not_missed'])[
+            'missed_payment'].cumsum()
+        df['prepaid_in_month'] = (
+                                         df['Payment_Due'] < df['Payment_Made']) & (df['Balance'] == 0)
         df['default_in_month'] = (df.n_missed_payments == 3)
-        df['defaulted'] = df.default_in_month.cumsum()
 
-        df['recovery_in_month'] = df.defaulted * (df.Payment_Made)
-        df['recovery_cumsum'] = df.recovery_in_month.cumsum()
+        df['defaulted'] = df.groupby(by=['loan_id'])['default_in_month'].cumsum()
+
+        df['recovery_in_month'] = df.defaulted * df.Payment_Made
+
+        df['recovery_cumsum'] = df.groupby(['loan_id'])['recovery_in_month'].cumsum()
+
         df['is_recovery_payment'] = df.defaulted & (df.Payment_Made > 0)
 
-        df['time_to_reversion'] = df['level_1'].dt.to_period('M').astype(int) - df['reversion_date'].dt.to_period(
-            'M').astype(int)
-        df['is_post_seller_purchsae_date'] = (df['level_1'] > df['investor_1_acquisition_date'])
+        df['time_to_reversion'] = df['level_1'].dt.to_period('M').astype(
+            int) - df['reversion_date'].dt.to_period('M').astype(int)
+        df['is_post_seller_purchase_date'] = (
+                df['level_1'] > df['investor_1_acquisition_date'])
 
-        postdefault_recoveries = sum(df['defaulted'] * df['Payment_Made'])
+        df = df.merge(pd.DataFrame({'post_default_recoveries': df.groupby(['loan_id'])[
+            'recovery_in_month'].sum()}).reset_index(), left_on='loan_id', right_on='loan_id')
 
-        df['postdefault_recoveries'] = postdefault_recoveries
+        df = df.merge(df[df.prepaid_in_month][['loan_id', 'level_1']].rename(columns={
+            'level_1': 'prepayment_date'}).reset_index(drop=True), left_on='loan_id', right_on='loan_id', how='left')
 
-        if df.prepaid_in_month.any():
-            prepayment_date = df[df.prepaid_in_month]['level_1'].item()
-        else:
-            prepayment_date = np.nan
-        df['prepayment_date'] = prepayment_date
+        df = df.merge(df[df.default_in_month][['loan_id', 'level_1']].rename(columns={
+            'level_1': 'date_of_default'}).reset_index(drop=True), left_on='loan_id', right_on='loan_id', how='left')
 
-        if df.default_in_month.any():
-            date_of_default = df[df.default_in_month]['level_1'].item()
-        else:
-            date_of_default = np.nan
-        df['date_of_default'] = date_of_default
-        if df.default_in_month.any():
-            exposure_at_default = df[df.default_in_month]['current_balance'].item()
-        else:
-            exposure_at_default = np.nan
-        df['exposure_at_default'] = exposure_at_default
+        df = df.merge(df[df.default_in_month][['loan_id', 'current_balance']].rename(columns={
+            'current_balance': 'exposure_at_default'}).reset_index(drop=True), left_on='loan_id', right_on='loan_id',
+                      how='left')
 
-        if exposure_at_default != 0:
-            recovery_percent = postdefault_recoveries / exposure_at_default
-        else:
-            recovery_percent = np.nan
-        df['recovery_percent'] = recovery_percent
+        df['recovery_percent'] = df['post_default_recoveries'] / df['exposure_at_default']
+
+        df['not_prepayment'] = np.logical_or(df['level_1'] < df['prepayment_date'],
+                                             pd.isnull(df['prepayment_date']))
+
+        df['not_defaulted'] = (df['defaulted'] == 0)
+
+        df['prepayment_next_month'] = (df['prepayment_date'].dt.to_period('M').astype(int) == (
+                df['level_1'].dt.to_period('M').astype(int) + 1))
+
+        df['default_next_month'] = (df['date_of_default'].dt.to_period('M').astype(int) == (
+                df['level_1'].dt.to_period('M').astype(int) + 1))
+
+        df['current_balance_prepayment_next_month'] = df['current_balance'] * df['prepayment_next_month']
+
+        df['not_prepayment_not_defaulted'] = np.logical_and(df['not_defaulted'], df['not_prepayment'])
+
+        df['balance_denominator'] = df['current_balance'] * df['not_prepayment_not_defaulted']
+
+        df['balance_numerator_smm'] = df['current_balance'] * df['prepayment_next_month']
+
+        df['balance_numerator_mdr'] = df['current_balance'] * df['default_next_month']
 
         return df
 
-    def create_enriched_data_portfolio(self, debug=False, n_loans=5):
+    def create_enriched_data_portfolio(self, debug=False, id_loans=None):
 
         if self.data is None:
             self.consolidate_data()
 
-        ids = self.loan_ids
+        data = self.data
         if debug:
-            ids = ids[:n_loans]
+            data = data[data.loan_ids.isin(id_loans)]
+            return data
 
-        extended_sub_datas = []
-        for idx in ids:
-            sub_data = self.data[self.data['loan_id'] == idx]
-            extended = self._extend_data_single_loan(sub_data)
-            extended_sub_datas.append(extended)
+        extended = self._extend_data(data)
 
-        enriched_data = pd.concat([df for df in extended_sub_datas if not df.empty])
-        self.enriched_data = enriched_data
-        self.seasonings = self.enriched_data.seasoning.unique()
-
+        self.enriched_data = extended
         logger.info('Finished Creating Portfolio Enriched Data')
 
-    @staticmethod
-    def _calculate_smm(dta):
+    def construct_portfolio_cpr(self, pivots=None):
 
-        numerator = 0.
-        denominator = 0.
-
-        for row in dta.itertuples():
-            if not (pd.isnull(row.prepayment_date)):
-                x = row.prepayment_date
-                y = row.level_1
-                months = (x.to_period('M') - y.to_period('M')).n
-
-                if months == 1:
-                    numerator += row.current_balance
-            if row.defaulted == 0:
-                if pd.isnull(row.prepayment_date) or row.level_1 < row.prepayment_date:
-                    denominator += row.current_balance
-
-        return numerator / denominator
-
-    def construct_portfolio_cpr(self, index='seasoning', pivots=None):
         if self.enriched_data is None:
             self.create_enriched_data_portfolio()
         df = self.enriched_data.copy()
 
-        index_values = df[index].unique()
-        unique_values = []
-        results = []
+        if pivots is None:
+            pivots = ['seasoning']
 
-        if pivots:
-            for pivot in pivots:
-                unique_values.append(df[pivot].unique())
-            for p, values in zip(pivots, unique_values):
-                for v in values:
-                    sub_data = df[df[p] == v]
-                    smms = []
-                    cprs = []
-                    for T in index_values:
-                        dta = sub_data[sub_data[index] == T]
-                        smm = self._calculate_smm(dta)
-                        smms.append(smm)
-                        cpr = 1. - ((1. - smm) ** 12)
-                        cprs.append(cpr)
-                    result = pd.DataFrame(
-                        {f'smm_{p}_{v}': smms, f'cpr_{p}_{v}': cprs}, index=index_values)
-                    results.append(result)
-            all_results = pd.concat(results, axis=1)
-        else:
-            smms = []
-            cprs = []
-            for T in index_values:
-                dta = df[df[index] == T]
-                smm = self._calculate_smm(dta)
-                smms.append(smm)
-                cpr = 1. - ((1. - smm) ** 12)
-                cprs.append(cpr)
-            all_results = pd.DataFrame(
-                {f'smm': smms, f'cpr': cprs}, index=index_values)
-        return all_results
+        numerator_smm = df.groupby(pivots)['balance_numerator_smm'].sum()
+        denominator = df.groupby(pivots)['balance_denominator'].sum()
 
-    @staticmethod
-    def _calculate_mdr(dta):
-        numerator = 0.
-        denominator = 0.
+        smm = numerator_smm / denominator
 
-        for row in dta.itertuples():
-            if not (pd.isnull(row.date_of_default)):
-                x = row.date_of_default
-                y = row.level_1
-                months = (x.to_period('M') - y.to_period('M')).n
-                if months == 1:
-                    numerator += row.current_balance
-            if row.defaulted == 0:
-                if pd.isnull(row.prepayment_date) or row.level_1 < row.prepayment_date:
-                    denominator += row.current_balance
-        return numerator / denominator
+        cpr = 1. - ((1. - smm) ** 12)
 
-    def construct_portfolio_cdr(self, index='seasoning', pivots=None):
+        if len(pivots) > 1:
+            cpr = cpr.unstack()
+
+        return cpr
+
+    def construct_portfolio_cdr(self, pivots=None):
+
         if self.enriched_data is None:
             self.create_enriched_data_portfolio()
         df = self.enriched_data.copy()
 
-        index_values = df[index].unique()
-        unique_values = []
-        results = []
+        if pivots is None:
+            pivots = ['seasoning']
 
-        if pivots:
-            unique_values = [df[pivot].unique() for pivot in pivots]
-            for p, values in zip(pivots, unique_values):
-                for v in values:
-                    sub_data = df[df[p] == v]
-                    mdrs = []
-                    cdrs = []
-                    for T in index_values:
-                        dta = sub_data[sub_data[index] == T]
-                        mdr = self._calculate_mdr(dta)
-                        mdrs.append(mdr)
-                        cdr = 1. - ((1. - mdr) ** 12)
-                        cdrs.append(cdr)
-                    result = pd.DataFrame(
-                        {f'mdr_{p}_{v}': mdrs, f'cdr_{p}_{v}': cdrs}, index=index_values)
-                    results.append(result)
-            all_results = pd.concat(results, axis=1)
-        else:
-            mdrs = []
-            cdrs = []
-            for T in index_values:
-                dta = df[df[index] == T]
-                mdr = self._calculate_mdr(dta)
-                mdrs.append(mdr)
-                cdr = 1. - ((1. - mdr) ** 12)
-                cdrs.append(cdr)
-            all_results = pd.DataFrame(
-                {f'mdr': mdrs, f'cdr': cdrs}, index=index_values)
-        return all_results
+        numerator_mdr = df.groupby(pivots)['balance_numerator_mdr'].sum()
+        denominator = df.groupby(pivots)['balance_denominator'].sum()
+
+        smm = numerator_mdr / denominator
+
+        cdr = (1. - ((1. - smm) ** 12))
+
+        if len(pivots) > 1:
+            cdr = cdr.unstack()
+
+        return cdr
 
     def _create_enriched_defaulted_data(self):
         if self.enriched_data is None:
@@ -274,37 +211,19 @@ class Loans_Portfolio(ABC):
 
         return self.enriched_data_defaulted
 
-    def construct_recovery_curve(self, index='months_since_default', pivots=None):
+    def construct_recovery_curve(self, pivots=None):
 
         if self.enriched_data_defaulted is None:
             self._create_enriched_defaulted_data()
-
         df = self.enriched_data_defaulted.copy()
-        index_values = df[index].unique()
-        results = []
+
+        groups = ['months_since_default'] + pivots if pivots else ['months_since_default']
+        ead = df.groupby(groups)['exposure_at_default'].sum()
+        recovery_sum = df.groupby(groups)['recovery_cumsum'].sum()
+
+        recovery_curve = recovery_sum / ead
+
         if pivots:
-            unique_values = [df[pivot].unique() for pivot in pivots]
-            for p, values in zip(pivots, unique_values):
-                for v in values:
-                    sub_data = df[df[p] == v]
-                    recovery_curve = []
-                    for n in index_values:
-                        dta = sub_data[sub_data[index] == n]
-                        if sum(dta.exposure_at_default) != 0:
-                            # recovery_pct = sum(dta.recovery_in_month) / sum(dta.exposure_at_default)
-                            recovery_pct = sum(dta.recovery_cumsum) / sum(dta.exposure_at_default)
-                        else:
-                            recovery_pct = np.nan
-                        recovery_curve.append(recovery_pct)
-                    result = pd.DataFrame({f'recovery_curve_{p}_{v}': recovery_curve}, index=index_values)
-                    results.append(result)
-            all_results = pd.concat(results, axis=1)
-        else:
-            recovery_curve = []
-            for v in index_values:
-                dta = df[df[index] == v]
-                # recovery_pct = sum(dta.recovery_in_month) / sum(dta.exposure_at_default)
-                recovery_pct = sum(dta.recovery_cumsum) / sum(dta.exposure_at_default)
-                recovery_curve.append(recovery_pct)
-            all_results = pd.DataFrame({'recovery_curve': recovery_curve}, index=index_values)
-        return all_results
+            recovery_curve = recovery_curve.unstack()
+
+        return recovery_curve
